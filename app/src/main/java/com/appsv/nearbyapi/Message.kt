@@ -7,5 +7,8 @@ data class Message(
     val senderId: String,
     val recipientId: String,
     val messageType: String, // "TEXT", "IMAGE", or "KEY"
-    val messageText: String  // Content, Base64 Image, or Base64 Public Key
+    val messageText: String,  // Content, Base64 Image, or Base64 Public Key
+    val timestamp: Long = System.currentTimeMillis(),
+    var isDeleted: Boolean = false,
+    var deletedForEveryone: Boolean = false
 ) : Serializable

@@ -15,14 +15,7 @@ import android.provider.Settings
 import android.util.Base64
 import android.util.Log
 import android.view.View
-import android.widget.ArrayAdapter
-import android.widget.Button
-import android.widget.EditText
-import android.widget.ImageButton
-import android.widget.ProgressBar
-import android.widget.Spinner
-import android.widget.TextView
-import android.widget.Toast
+import android.widget.*
 import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
@@ -31,16 +24,12 @@ import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
+import com.appsv.nearbyapi.database.ChatDatabase
+import com.appsv.nearbyapi.database.MessageEntity
 import com.example.offlinechatapp.R
 import com.google.android.gms.nearby.Nearby
 import com.google.android.gms.nearby.connection.*
-import com.google.crypto.tink.BinaryKeysetReader
-import com.google.crypto.tink.BinaryKeysetWriter
-import com.google.crypto.tink.CleartextKeysetHandle
-import com.google.crypto.tink.HybridDecrypt
-import com.google.crypto.tink.HybridEncrypt
-import com.google.crypto.tink.KeyTemplates
-import com.google.crypto.tink.KeysetHandle
+import com.google.crypto.tink.*
 import com.google.crypto.tink.config.TinkConfig
 import kotlinx.coroutines.*
 import java.io.ByteArrayInputStream
@@ -50,16 +39,15 @@ import java.util.*
 import kotlin.concurrent.thread
 
 class MainActivity : AppCompatActivity() {
-
-    private val STRATEGY = Strategy.P2P_STAR
-    private val SERVICE_ID = "com.appsv.nearbyapi.SERVICE_ID"
-
-    // --- HEARTBEAT CONSTANTS ---
-    private val HEARTBEAT_INTERVAL_MS = 15000L // Send heartbeat every 15s (Faster for testing)
-    private val TIMEOUT_MS = 45000L // Mark offline if not seen for 45s
-
-    // --- COROUTINES ---
+    
+    private val strategy = Strategy.P2P_STAR
+    private val serviceId = "com.appsv.nearbyapi.SERVICE_ID"
+    private val heartbeatIntervalMs = 15000L
+    private val timeoutMs = 45000L
     private val mainScope = CoroutineScope(Dispatchers.Main + Job())
+
+    // Database
+    private lateinit var database: ChatDatabase
 
     // Persist User ID
     private val myUsername: String by lazy {
@@ -85,27 +73,23 @@ class MainActivity : AppCompatActivity() {
     private lateinit var userIdTextView: TextView
     private lateinit var messagesRecyclerView: RecyclerView
     private lateinit var messageEditText: EditText
-
     private lateinit var recipientSpinner: Spinner
     private lateinit var recipientAdapter: ArrayAdapter<String>
     private val recipientList = ArrayList<String>()
-
     private lateinit var targetUserEditText: EditText
-
     private lateinit var sendBroadcastButton: Button
     private lateinit var sendPrivateButton: Button
-
-    // NEW BUTTON
     private lateinit var showMembersButton: Button
-
     private lateinit var advertiseButton: Button
     private lateinit var discoverButton: Button
     private lateinit var discoveredDevicesRecyclerView: RecyclerView
     private lateinit var discoveredDevicesLabel: TextView
     private lateinit var attachImageButton: ImageButton
     private lateinit var attachmentPreviewTextView: TextView
-
     private lateinit var sendingProgressBar: ProgressBar
+
+    // NEW: Send to Self button
+    private lateinit var sendToSelfButton: Button
 
     private var pendingImageUri: Uri? = null
 
@@ -122,10 +106,10 @@ class MainActivity : AppCompatActivity() {
             uri?.let {
                 pendingImageUri = it
                 val fileName = getFileName(it)
-                attachmentPreviewTextView.text = "Attached: $fileName (click to clear)"
+                attachmentPreviewTextView.text = getString(R.string.attached_file, fileName)
                 attachmentPreviewTextView.visibility = View.VISIBLE
                 messageEditText.isEnabled = false
-                messageEditText.hint = "Image attached"
+                messageEditText.hint = getString(R.string.image_attached)
             }
         }
 
@@ -163,60 +147,79 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
+        // Initialize Database
+        database = ChatDatabase.getDatabase(this)
+
         // Init Myself in MeshRepository
-        MeshRepository.updateMember(myUsername, "You", System.currentTimeMillis())
+        MeshRepository.updateMember(myUsername, getString(R.string.you), System.currentTimeMillis())
 
         initEncryption()
 
         if (savedInstanceState != null) {
-            messages = (savedInstanceState.getSerializable(KEY_MESSAGES) as? ArrayList<Message>)?.toMutableList() ?: mutableListOf()
-            seenSet = (savedInstanceState.getSerializable(KEY_SEEN_SET) as? HashSet<String>)?.toMutableSet() ?: mutableSetOf()
+            val savedSeenSet = savedInstanceState.getSerializable(KEY_SEEN_SET) as? HashSet<String>
+            if (savedSeenSet != null) {
+                seenSet = savedSeenSet
+            }
         }
 
         connectionsClient = Nearby.getConnectionsClient(this)
+
+        // Initialize UI elements
         userIdTextView = findViewById(R.id.userIdTextView)
         messagesRecyclerView = findViewById(R.id.messagesRecyclerView)
         messageEditText = findViewById(R.id.messageEditText)
-
         recipientSpinner = findViewById(R.id.recipientSpinner)
-        recipientAdapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, recipientList)
-        recipientSpinner.adapter = recipientAdapter
-
         targetUserEditText = findViewById(R.id.targetUserEditText)
-
         sendBroadcastButton = findViewById(R.id.sendBroadcastButton)
         sendPrivateButton = findViewById(R.id.sendPrivateButton)
-
-        // NEW BUTTON
         showMembersButton = findViewById(R.id.showMembersButton)
-
         advertiseButton = findViewById(R.id.advertiseButton)
         discoverButton = findViewById(R.id.discoverButton)
         discoveredDevicesRecyclerView = findViewById(R.id.discoveredDevicesRecyclerView)
         discoveredDevicesLabel = findViewById(R.id.discoveredDevicesLabel)
         attachImageButton = findViewById(R.id.attachImageButton)
         attachmentPreviewTextView = findViewById(R.id.attachmentPreviewTextView)
-
         sendingProgressBar = findViewById(R.id.sendingProgressBar)
+        sendToSelfButton = findViewById(R.id.sendToSelfButton)
 
-        userIdTextView.text = "Your ID: $myUsername"
+        // Add "Myself" to recipient list for testing
+        recipientList.add(getString(R.string.myself))
+        recipientAdapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, recipientList)
+        recipientSpinner.adapter = recipientAdapter
 
-        messageAdapter = MessageAdapter(messages, myUsername)
+        userIdTextView.text = getString(R.string.user_id_label, myUsername)
+
+        messageAdapter = MessageAdapter(
+            messages,
+            myUsername,
+            onDeleteForMe = { msgId -> handleDeleteForMe(msgId) },
+            onDeleteForEveryone = { msgId -> handleDeleteForEveryone(msgId) }
+        )
         messagesRecyclerView.layoutManager = LinearLayoutManager(this)
         messagesRecyclerView.adapter = messageAdapter
+
+        // Load messages from database
+        loadMessagesFromDatabase()
 
         discoveredDeviceAdapter = DiscoveredDeviceAdapter(discoveredEndpoints.toList()) { endpointId ->
             if (!connectedEndpoints.containsKey(endpointId)) {
                 connectionsClient.requestConnection(myUsername, endpointId, connectionLifecycleCallback)
-                    .addOnSuccessListener { Toast.makeText(this, "Connection requested...", Toast.LENGTH_SHORT).show() }
-                    .addOnFailureListener { e -> Toast.makeText(this, "Failed to request connection", Toast.LENGTH_SHORT).show() }
+                    .addOnSuccessListener { Toast.makeText(this, getString(R.string.connection_requested), Toast.LENGTH_SHORT).show() }
+                    .addOnFailureListener { Toast.makeText(this, getString(R.string.failed_to_request_connection), Toast.LENGTH_SHORT).show() }
             } else {
-                Toast.makeText(this, "Already connected.", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, getString(R.string.already_connected), Toast.LENGTH_SHORT).show()
             }
         }
         discoveredDevicesRecyclerView.layoutManager = LinearLayoutManager(this)
         discoveredDevicesRecyclerView.adapter = discoveredDeviceAdapter
 
+        setupClickListeners()
+    }
+
+// Continued in Part 2...
+// Continuation of MainActivity.kt
+
+    private fun setupClickListeners() {
         advertiseButton.setOnClickListener {
             if (isAdvertising) stopAdvertising() else {
                 if (hasPermissions()) startAdvertising() else requestPermissions()
@@ -229,14 +232,12 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        // NEW: Open Members Activity
         showMembersButton.setOnClickListener {
             val intent = Intent(this, MembersActivity::class.java)
             startActivity(intent)
         }
 
         attachImageButton.setOnClickListener { imagePickerLauncher.launch("image/*") }
-
         attachmentPreviewTextView.setOnClickListener { clearAttachment() }
 
         sendBroadcastButton.setOnClickListener {
@@ -249,10 +250,94 @@ class MainActivity : AppCompatActivity() {
 
             if (manualId.isNotEmpty()) {
                 sendMessage(manualId)
+            } else if (spinnerId == getString(R.string.myself)) {
+                sendMessage(myUsername) // Send to self
             } else if (spinnerId != null) {
                 sendMessage(spinnerId)
             } else {
-                Toast.makeText(this, "Please select or enter a recipient", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, getString(R.string.please_select_or_enter_recipient), Toast.LENGTH_SHORT).show()
+            }
+        }
+
+        // NEW: Quick button to send to self
+        sendToSelfButton.setOnClickListener {
+            sendMessage(myUsername)
+        }
+    }
+
+    private fun loadMessagesFromDatabase() {
+        mainScope.launch {
+            try {
+                val dbMessages = withContext(Dispatchers.IO) {
+                    database.messageDao().getMessagesForUser(myUsername)
+                }
+
+                messages.clear()
+                messages.addAll(dbMessages.map { entity ->
+                    Message(
+                        msgId = entity.msgId,
+                        senderId = entity.senderId,
+                        recipientId = entity.recipientId,
+                        messageType = entity.messageType,
+                        messageText = entity.messageText,
+                        timestamp = entity.timestamp,
+                        isDeleted = entity.isDeleted,
+                        deletedForEveryone = entity.deletedForEveryone
+                    )
+                })
+
+                messageAdapter.notifyDataSetChanged()
+                messagesRecyclerView.scrollToPosition(messages.size - 1)
+
+                Log.d("MainActivity", "Loaded ${messages.size} messages from database")
+            } catch (e: Exception) {
+                Log.e("MainActivity", "Error loading messages", e)
+            }
+        }
+    }
+
+    private fun handleDeleteForMe(msgId: String) {
+        mainScope.launch {
+            try {
+                withContext(Dispatchers.IO) {
+                    database.messageDao().deleteMessageForMe(msgId)
+                }
+                messageAdapter.updateMessage(msgId, isDeleted = true, deletedForEveryone = false)
+                Toast.makeText(this@MainActivity, getString(R.string.message_deleted_for_you), Toast.LENGTH_SHORT).show()
+            } catch (e: Exception) {
+                Log.e("MainActivity", "Error deleting message for me", e)
+                Toast.makeText(this@MainActivity, getString(R.string.failed_to_delete_message), Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+
+    private fun handleDeleteForEveryone(msgId: String) {
+        mainScope.launch {
+            try {
+                // Update in database
+                withContext(Dispatchers.IO) {
+                    database.messageDao().deleteMessageForEveryone(msgId)
+                }
+
+                // Update UI
+                messageAdapter.updateMessage(msgId, isDeleted = true, deletedForEveryone = true)
+
+                // Send delete notification to network
+                val deleteMessage = Message(
+                    msgId = "DEL-$msgId-${System.currentTimeMillis()}",
+                    senderId = myUsername,
+                    recipientId = "BROADCAST",
+                    messageType = "DELETE_FOR_EVERYONE",
+                    messageText = msgId // The ID of the message to delete
+                )
+
+                seenSet.add(deleteMessage.msgId)
+                forwardMessage(deleteMessage)
+
+                Toast.makeText(this@MainActivity, getString(R.string.message_deleted_for_everyone), Toast.LENGTH_SHORT).show()
+            } catch (e: Exception) {
+                Log.e("MainActivity", "Error deleting message for everyone", e)
+                Toast.makeText(this@MainActivity, getString(R.string.failed_to_delete_message), Toast.LENGTH_SHORT).show()
             }
         }
     }
@@ -274,14 +359,11 @@ class MainActivity : AppCompatActivity() {
             myPublicKeyStr = Base64.encodeToString(outputStream.toByteArray(), Base64.NO_WRAP)
 
             Log.d("Encryption", "Keys generated successfully.")
-
         } catch (e: Exception) {
             Log.e("Encryption", "Error initializing encryption", e)
-            Toast.makeText(this, "Encryption Error: ${e.message}", Toast.LENGTH_LONG).show()
+            Toast.makeText(this, getString(R.string.encryption_error, e.message), Toast.LENGTH_LONG).show()
         }
     }
-
-    // --- GOSSIP / PRESENCE LOGIC ---
 
     private fun startHeartbeat() {
         mainScope.launch {
@@ -289,21 +371,19 @@ class MainActivity : AppCompatActivity() {
                 if (connectedEndpoints.isNotEmpty()) {
                     sendPresenceHeartbeat()
                 }
-                MeshRepository.pruneExpiredMembers(TIMEOUT_MS)
-                delay(HEARTBEAT_INTERVAL_MS)
+                MeshRepository.pruneExpiredMembers(timeoutMs)
+                delay(heartbeatIntervalMs)
             }
         }
     }
 
     private fun sendPresenceHeartbeat() {
         val msgId = "$myUsername-P-${System.currentTimeMillis()}"
-        // We pack the timestamp and name into the messageText.
-        // Format: "TIMESTAMP_NAME"
         val content = "${System.currentTimeMillis()}_$myUsername"
         val message = Message(msgId, myUsername, "BROADCAST", "PRESENCE", content)
 
         seenSet.add(msgId)
-        MeshRepository.updateMember(myUsername, "You", System.currentTimeMillis()) // Update self
+        MeshRepository.updateMember(myUsername, "You", System.currentTimeMillis())
         forwardMessage(message)
     }
 
@@ -315,24 +395,21 @@ class MainActivity : AppCompatActivity() {
         forwardMessage(message)
     }
 
-    // --- LIFECYCLE ---
-
     override fun onSaveInstanceState(outState: Bundle) {
         super.onSaveInstanceState(outState)
-        outState.putSerializable(KEY_MESSAGES, ArrayList(messages))
         outState.putSerializable(KEY_SEEN_SET, HashSet(seenSet))
     }
 
     override fun onStart() {
         super.onStart()
         if (!hasPermissions()) requestPermissions()
-        startHeartbeat() // START GOSSIP
+        startHeartbeat()
     }
 
     override fun onDestroy() {
         connectionsClient.stopAllEndpoints()
         connectedEndpoints.clear()
-        mainScope.cancel() // Stop coroutines
+        mainScope.cancel()
         super.onDestroy()
     }
 
@@ -349,17 +426,17 @@ class MainActivity : AppCompatActivity() {
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode == REQUEST_CODE_PERMISSIONS && !(grantResults.isNotEmpty() && grantResults.all { it == PackageManager.PERMISSION_GRANTED })) {
-            Toast.makeText(this, "Permissions required.", Toast.LENGTH_LONG).show()
+            Toast.makeText(this, getString(R.string.permissions_required), Toast.LENGTH_LONG).show()
         }
     }
 
     private fun startAdvertising() {
-        val advertisingOptions = AdvertisingOptions.Builder().setStrategy(STRATEGY).build()
-        connectionsClient.startAdvertising(myUsername, SERVICE_ID, connectionLifecycleCallback, advertisingOptions)
+        val advertisingOptions = AdvertisingOptions.Builder().setStrategy(strategy).build()
+        connectionsClient.startAdvertising(myUsername, serviceId, connectionLifecycleCallback, advertisingOptions)
             .addOnSuccessListener {
                 isAdvertising = true
-                advertiseButton.text = "Stop Advertising"
-                Toast.makeText(this, "Advertising...", Toast.LENGTH_SHORT).show()
+                advertiseButton.text = getString(R.string.stop_advertising)
+                Toast.makeText(this, getString(R.string.advertising), Toast.LENGTH_SHORT).show()
             }
             .addOnFailureListener { isAdvertising = false }
     }
@@ -367,15 +444,15 @@ class MainActivity : AppCompatActivity() {
     private fun stopAdvertising() {
         connectionsClient.stopAdvertising()
         isAdvertising = false
-        advertiseButton.text = "Advertise"
+        advertiseButton.text = getString(R.string.advertise)
     }
 
     private fun startDiscovery() {
-        val discoveryOptions = DiscoveryOptions.Builder().setStrategy(STRATEGY).build()
-        connectionsClient.startDiscovery(SERVICE_ID, endpointDiscoveryCallback, discoveryOptions)
+        val discoveryOptions = DiscoveryOptions.Builder().setStrategy(strategy).build()
+        connectionsClient.startDiscovery(serviceId, endpointDiscoveryCallback, discoveryOptions)
             .addOnSuccessListener {
                 isDiscovering = true
-                discoverButton.text = "Stop Discovery"
+                discoverButton.text = getString(R.string.stop_discovery)
                 discoveredDevicesLabel.visibility = View.VISIBLE
                 discoveredDevicesRecyclerView.visibility = View.VISIBLE
             }
@@ -385,32 +462,35 @@ class MainActivity : AppCompatActivity() {
     private fun stopDiscovery() {
         connectionsClient.stopDiscovery()
         isDiscovering = false
-        discoverButton.text = "Discover"
+        discoverButton.text = getString(R.string.discover)
         discoveredEndpoints.clear()
         updateDiscoveredDevicesList()
         discoveredDevicesLabel.visibility = View.GONE
         discoveredDevicesRecyclerView.visibility = View.GONE
     }
 
+// Continued in Part 3...
+// Continuation of MainActivity.kt - Part 3
+
     private val connectionLifecycleCallback = object : ConnectionLifecycleCallback() {
         override fun onConnectionInitiated(endpointId: String, connectionInfo: ConnectionInfo) {
             AlertDialog.Builder(this@MainActivity)
-                .setTitle("Accept Connection")
-                .setMessage("Connect to ${connectionInfo.endpointName}?")
-                .setPositiveButton("Accept") { _, _ ->
+                .setTitle(getString(R.string.accept_connection))
+                .setMessage(getString(R.string.connect_to_user, connectionInfo.endpointName))
+                .setPositiveButton(getString(R.string.accept)) { _, _ ->
                     connectionsClient.acceptConnection(endpointId, payloadCallback)
                     connectedEndpoints[endpointId] = connectionInfo.endpointName
                 }
-                .setNegativeButton("Reject") { _, _ -> connectionsClient.rejectConnection(endpointId) }
+                .setNegativeButton(getString(R.string.reject)) { _, _ -> connectionsClient.rejectConnection(endpointId) }
                 .show()
         }
 
         override fun onConnectionResult(endpointId: String, result: ConnectionResolution) {
             if (result.status.statusCode == ConnectionsStatusCodes.STATUS_OK) {
-                Toast.makeText(this@MainActivity, "Connected!", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this@MainActivity, getString(R.string.connected), Toast.LENGTH_SHORT).show()
                 stopDiscovery()
                 broadcastPublicKey()
-                sendPresenceHeartbeat() // IMMEDIATE ADVERTISEMENT
+                sendPresenceHeartbeat()
             } else {
                 connectedEndpoints.remove(endpointId)
             }
@@ -427,7 +507,7 @@ class MainActivity : AppCompatActivity() {
                         recipientList.remove(username)
                         recipientAdapter.notifyDataSetChanged()
                     }
-                    Toast.makeText(this@MainActivity, "Disconnected", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this@MainActivity, getString(R.string.disconnected), Toast.LENGTH_SHORT).show()
                 }
             }
         }
@@ -455,14 +535,7 @@ class MainActivity : AppCompatActivity() {
         discoveredDevicesRecyclerView.adapter = discoveredDeviceAdapter
     }
 
-    // --- SENDING LOGIC ---
-
     private fun sendMessage(recipientId: String) {
-        if (connectedEndpoints.isEmpty()) {
-            Toast.makeText(this, "No connection.", Toast.LENGTH_SHORT).show()
-            return
-        }
-
         val inputText = messageEditText.text.toString().trim()
         val imageUri = pendingImageUri
 
@@ -471,6 +544,7 @@ class MainActivity : AppCompatActivity() {
         sendingProgressBar.visibility = View.VISIBLE
         sendBroadcastButton.isEnabled = false
         sendPrivateButton.isEnabled = false
+        sendToSelfButton.isEnabled = false
 
         clearAttachment()
         messageEditText.text.clear()
@@ -493,7 +567,49 @@ class MainActivity : AppCompatActivity() {
                     type = "TEXT"
                 }
 
-                if (recipientId != "BROADCAST") {
+                // Handle sending to self (offline mode - no encryption needed)
+                if (recipientId == myUsername) {
+                    val msgForLocal = Message(
+                        msgId,
+                        myUsername,
+                        myUsername,
+                        type,
+                        rawContent,
+                        timestamp = System.currentTimeMillis()
+                    )
+
+                    // Save to database
+                    mainScope.launch {
+                        try {
+                            withContext(Dispatchers.IO) {
+                                database.messageDao().insertMessage(
+                                    MessageEntity(
+                                        msgId = msgForLocal.msgId,
+                                        senderId = msgForLocal.senderId,
+                                        recipientId = msgForLocal.recipientId,
+                                        messageType = msgForLocal.messageType,
+                                        messageText = msgForLocal.messageText,
+                                        timestamp = msgForLocal.timestamp
+                                    )
+                                )
+                            }
+
+                            runOnUiThread {
+                                messages.add(msgForLocal)
+                                messageAdapter.notifyItemInserted(messages.size - 1)
+                                messagesRecyclerView.scrollToPosition(messages.size - 1)
+                                resetUI()
+                            }
+                        } catch (e: Exception) {
+                            Log.e("MainActivity", "Error saving message to self", e)
+                            runOnUiThread { resetUI() }
+                        }
+                    }
+                    return@thread
+                }
+
+                // Handle network messages (existing encryption logic)
+                if (recipientId != "BROADCAST" && connectedEndpoints.isNotEmpty()) {
                     val recipientKey = peerPublicKeys[recipientId]
                     if (recipientKey != null) {
                         try {
@@ -501,30 +617,69 @@ class MainActivity : AppCompatActivity() {
                             content = Base64.encodeToString(encryptedBytes, Base64.NO_WRAP)
                         } catch (e: Exception) {
                             runOnUiThread {
-                                Toast.makeText(this, "Encryption failed", Toast.LENGTH_SHORT).show()
+                                Toast.makeText(this, getString(R.string.encryption_failed), Toast.LENGTH_SHORT).show()
                                 resetUI()
                             }
                             return@thread
                         }
                     } else {
                         runOnUiThread {
-                            Toast.makeText(this, "Warning: Key not found (Mesh routing?)", Toast.LENGTH_SHORT).show()
+                            Toast.makeText(this, getString(R.string.warning_key_not_found), Toast.LENGTH_SHORT).show()
                         }
                     }
                 }
 
-                val msgForNetwork = Message(msgId, myUsername, recipientId, type, content)
-                val msgForLocal = Message(msgId, myUsername, recipientId, type, rawContent)
+                val msgForNetwork = Message(
+                    msgId,
+                    myUsername,
+                    recipientId,
+                    type,
+                    content,
+                    timestamp = System.currentTimeMillis()
+                )
+
+                val msgForLocal = Message(
+                    msgId,
+                    myUsername,
+                    recipientId,
+                    type,
+                    rawContent,
+                    timestamp = System.currentTimeMillis()
+                )
 
                 seenSet.add(msgId)
 
-                runOnUiThread {
-                    messages.add(msgForLocal)
-                    messageAdapter.notifyItemInserted(messages.size - 1)
-                    messagesRecyclerView.scrollToPosition(messages.size - 1)
-                    resetUI()
+                // Save to database
+                mainScope.launch {
+                    try {
+                        withContext(Dispatchers.IO) {
+                            database.messageDao().insertMessage(
+                                MessageEntity(
+                                    msgId = msgForLocal.msgId,
+                                    senderId = msgForLocal.senderId,
+                                    recipientId = msgForLocal.recipientId,
+                                    messageType = msgForLocal.messageType,
+                                    messageText = msgForLocal.messageText,
+                                    timestamp = msgForLocal.timestamp
+                                )
+                            )
+                        }
+
+                        runOnUiThread {
+                            messages.add(msgForLocal)
+                            messageAdapter.notifyItemInserted(messages.size - 1)
+                            messagesRecyclerView.scrollToPosition(messages.size - 1)
+                            resetUI()
+                        }
+                    } catch (e: Exception) {
+                        Log.e("MainActivity", "Error saving message", e)
+                        runOnUiThread { resetUI() }
+                    }
                 }
-                forwardMessage(msgForNetwork)
+
+                if (connectedEndpoints.isNotEmpty()) {
+                    forwardMessage(msgForNetwork)
+                }
 
             } catch (e: Exception) {
                 Log.e("MainActivity", "Error in sendMessage thread", e)
@@ -537,6 +692,7 @@ class MainActivity : AppCompatActivity() {
         sendingProgressBar.visibility = View.GONE
         sendBroadcastButton.isEnabled = true
         sendPrivateButton.isEnabled = true
+        sendToSelfButton.isEnabled = true
     }
 
     private fun forwardMessage(message: Message) {
@@ -546,7 +702,8 @@ class MainActivity : AppCompatActivity() {
             .addOnFailureListener { e -> Log.e("MainActivity", "Send failed", e) }
     }
 
-    // --- RECEIVING LOGIC ---
+// Continued in Part 4...
+// Continuation of MainActivity.kt - Part 4
 
     private val payloadCallback = object : PayloadCallback() {
         override fun onPayloadReceived(endpointId: String, payload: Payload) {
@@ -563,20 +720,36 @@ class MainActivity : AppCompatActivity() {
                     if (seenSet.contains(msgId)) return
                     seenSet.add(msgId)
 
-                    // 1. Handle PRESENCE immediately
+                    // Handle DELETE_FOR_EVERYONE
+                    if (type == "DELETE_FOR_EVERYONE") {
+                        val originalMsgId = content
+                        mainScope.launch {
+                            try {
+                                withContext(Dispatchers.IO) {
+                                    database.messageDao().deleteMessageForEveryone(originalMsgId)
+                                }
+                                messageAdapter.updateMessage(originalMsgId, isDeleted = true, deletedForEveryone = true)
+                            } catch (e: Exception) {
+                                Log.e("MainActivity", "Error processing delete", e)
+                            }
+                        }
+                        forwardMessage(Message(msgId, sender, recipient, type, content))
+                        return
+                    }
+
+                    // Handle PRESENCE
                     if (type == "PRESENCE") {
-                        // Content format: "TIMESTAMP_NAME"
                         val data = content.split("_", limit = 2)
                         if (data.size == 2) {
                             val timestamp = data[0].toLongOrNull() ?: System.currentTimeMillis()
                             val name = data[1]
                             MeshRepository.updateMember(sender, name, timestamp)
                         }
-                        // Flood the presence update
                         forwardMessage(Message(msgId, sender, recipient, type, content))
                         return
                     }
 
+                    // Handle KEY
                     if (type == "KEY") {
                         handleIncomingKey(sender, content)
                         forwardMessage(Message(msgId, sender, recipient, type, content))
@@ -588,8 +761,7 @@ class MainActivity : AppCompatActivity() {
                     if (recipient == "BROADCAST") {
                         displayMessage(msgId, sender, recipient, type, content)
                         shouldForward = true
-                    }
-                    else if (recipient == myUsername) {
+                    } else if (recipient == myUsername) {
                         // Message for ME
                         try {
                             val ciphertext = Base64.decode(content, Base64.NO_WRAP)
@@ -601,8 +773,7 @@ class MainActivity : AppCompatActivity() {
 
                         displayMessage(msgId, sender, recipient, type, content)
                         shouldForward = false
-                    }
-                    else {
+                    } else {
                         // Message for SOMEONE ELSE -> Flood it
                         shouldForward = true
                     }
@@ -618,11 +789,39 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun displayMessage(msgId: String, sender: String, recipient: String, type: String, content: String) {
-        val msgObj = Message(msgId, sender, recipient, type, content)
-        runOnUiThread {
-            messages.add(msgObj)
-            messageAdapter.notifyItemInserted(messages.size - 1)
-            messagesRecyclerView.scrollToPosition(messages.size - 1)
+        val msgObj = Message(
+            msgId,
+            sender,
+            recipient,
+            type,
+            content,
+            timestamp = System.currentTimeMillis()
+        )
+
+        // Save to database
+        mainScope.launch {
+            try {
+                withContext(Dispatchers.IO) {
+                    database.messageDao().insertMessage(
+                        MessageEntity(
+                            msgId = msgObj.msgId,
+                            senderId = msgObj.senderId,
+                            recipientId = msgObj.recipientId,
+                            messageType = msgObj.messageType,
+                            messageText = msgObj.messageText,
+                            timestamp = msgObj.timestamp
+                        )
+                    )
+                }
+
+                runOnUiThread {
+                    messages.add(msgObj)
+                    messageAdapter.notifyItemInserted(messages.size - 1)
+                    messagesRecyclerView.scrollToPosition(messages.size - 1)
+                }
+            } catch (e: Exception) {
+                Log.e("MainActivity", "Error saving received message", e)
+            }
         }
     }
 
@@ -641,7 +840,7 @@ class MainActivity : AppCompatActivity() {
                 if (!recipientList.contains(senderId)) {
                     recipientList.add(senderId)
                     recipientAdapter.notifyDataSetChanged()
-                    Toast.makeText(this, "User $senderId available", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this, getString(R.string.user_available, senderId), Toast.LENGTH_SHORT).show()
                 }
             }
         } catch (e: Exception) {
@@ -651,7 +850,7 @@ class MainActivity : AppCompatActivity() {
 
     @SuppressLint("Range")
     private fun getFileName(uri: Uri): String {
-        var name = "unknown.jpg"
+        var name = getString(R.string.unknown_jpg)
         val cursor = contentResolver.query(uri, null, null, null, null)
         cursor?.use {
             if (it.moveToFirst()) name = it.getString(it.getColumnIndex(OpenableColumns.DISPLAY_NAME))
@@ -663,7 +862,7 @@ class MainActivity : AppCompatActivity() {
         pendingImageUri = null
         attachmentPreviewTextView.visibility = View.GONE
         messageEditText.isEnabled = true
-        messageEditText.hint = "Type a message..."
+        messageEditText.hint = getString(R.string.type_a_message)
     }
 
     private fun uriToBase64(uri: Uri): String? {

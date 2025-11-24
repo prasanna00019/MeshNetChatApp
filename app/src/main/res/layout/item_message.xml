@@ -36,7 +36,6 @@
             android:visibility="gone"
             android:layout_marginTop="4dp" />
 
-        <!-- NEW: Download Button -->
         <Button
             android:id="@+id/downloadImageButton"
             android:layout_width="wrap_content"
@@ -54,6 +53,17 @@
             android:layout_height="wrap_content"
             android:textColor="@android:color/black"
             android:textSize="16sp" />
+
+        <!-- NEW: Timestamp -->
+        <TextView
+            android:id="@+id/timestampTextView"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:textSize="10sp"
+            android:layout_marginTop="4dp"
+            android:textColor="#888888"
+            android:layout_gravity="end"
+            android:visibility="gone"/>
 
     </LinearLayout>
 
